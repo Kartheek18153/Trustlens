@@ -7,6 +7,7 @@ import { dohTxt, dohMx } from "./doh.js";
 import { BRANDS as BIG_BRANDS } from "./brands.js";
 import { isDisposable } from "./disposable.js";
 import { getBackendUrl } from "./backend.js";
+import { isPopularRoot } from "./popular.js";
 
 // --- 1. Domain age (RDAP) ---
 async function testDomainAge(host) {
@@ -14,6 +15,11 @@ async function testDomainAge(host) {
   const domain = getRootDomain(host);
   if (!isValidDomain(domain)) {
     return { name, passed: false, weight: 30, reason: "Invalid domain", evidence: host };
+  }
+  // Popular domains skip the age penalty — a brand-new host on a known-big
+  // domain (e.g. new google subdomain) was Safe yesterday too.
+  if (isPopularRoot(domain)) {
+    return { name, passed: true, weight: 0, reason: `Well-known domain — age check skipped`, evidence: domain, skipped: true };
   }
   try {
     const controller = new AbortController();
@@ -73,6 +79,9 @@ const TRUSTED_REGISTRARS = new Set([
 async function testRegistrarReputation(host) {
   const name = "Registrar Reputation";
   const domain = getRootDomain(host);
+  if (isPopularRoot(domain)) {
+    return { name, passed: true, weight: 0, reason: `Well-known domain — registrar check skipped`, evidence: domain, skipped: true };
+  }
   try {
     const controller = new AbortController();
     const tid = setTimeout(() => controller.abort(), 4000);

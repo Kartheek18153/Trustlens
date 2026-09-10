@@ -11,6 +11,7 @@
 
 import { BRANDS } from "./brands.js";
 import { getRootDomain } from "./domain.js";
+import { isPopularRoot } from "./popular.js";
 
 const FAVICON_URLS = [
   (host) => `https://www.google.com/s2/favicons?sz=64&domain=${encodeURIComponent(host)}`,
@@ -182,6 +183,9 @@ export async function testFaviconPhash(host, domainAgeDays) {
   try {
     if (typeof domainAgeDays === "number" && domainAgeDays > 365) {
       return { name, passed: true, weight: 0, reason: `Domain is ${domainAgeDays} days old — favicon brand match skipped`, evidence: domain };
+    }
+    if (isPopularRoot(domain)) {
+      return { name, passed: true, weight: 0, reason: `Well-known domain — favicon brand match skipped`, evidence: domain, skipped: true };
     }
     const target = await hashFavicon(domain);
     if (!target) {

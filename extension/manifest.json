@@ -12,7 +12,10 @@
     "https://safebrowsing.googleapis.com/*",
     "https://*.googleusercontent.com/*",
     "https://ipinfo.io/*",
-    "https://*.workers.dev/*"
+    "https://*.workers.dev/*",
+    "https://disposable.github.io/*",
+    "https://data.phishtank.com/*",
+    "https://urlhaus-api.abuse.ch/*"
   ],
   "optional_host_permissions": ["https://*/*"],
   "action": {

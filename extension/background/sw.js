@@ -15,6 +15,7 @@ import { testDnssec, testCrossResolver } from "./test_dnssec.js";
 import { testFaviconPhash } from "./test_favicon.js";
 import { testHomoglyph } from "./test_homoglyph.js";
 import { testHighRiskDomain } from "./test_highrisk.js";
+import { testBrandSubdomain } from "./test_brand_subdomain.js";
 import { testPhishtank } from "./test_phishtank.js";
 import { testUrlhaus } from "./test_urlhaus.js";
 import { testBackend, prewarm as prewarmBackend } from "./backend.js";
@@ -22,6 +23,7 @@ import { compositeSignals } from "./composite.js";
 import { testHistoryRotation, fingerprint } from "./history_rotation.js";
 import { prewarm as prewarmDisposable } from "./disposable.js";
 import { getRootDomain, isValidDomain, isCheckableHost } from "./domain.js";
+import { isPopularRoot } from "./popular.js";
 
 const HISTORY_KEY = "trustlens.history";
 const HISTORY_MAX = 50;
@@ -67,7 +69,9 @@ async function scoreHost(host, url) {
     : { name: "HTTPS Enabled", passed: false, weight: 25, reason: "Site is not using HTTPS", evidence: url || host };
   // Run the age test first so the brand tests can use its result.
   const ageTest = await testDomainAge(root);
-  const domainAgeDays = parseAgeDays(ageTest);
+  // Popular domains skip the RDAP age lookup; feed downstream tests a
+  // synthetic "old" so typosquat/highrisk take their aged-domain skip path.
+  const domainAgeDays = parseAgeDays(ageTest) ?? (isPopularRoot(root) ? 400 : null);
   const network = await Promise.all([
     testSafeBrowsing(root),
     testDnssec(root),
@@ -79,6 +83,7 @@ async function scoreHost(host, url) {
     testTyposquat(root, domainAgeDays),
     testFaviconPhash(root, domainAgeDays),
     testHighRiskDomain(root, domainAgeDays),
+    testBrandSubdomain(host),
     testBackend(root),
     testEmailAuth(root, { domainAgeDays, hasLoginForms: false }),
     Promise.resolve(httpsTest),
@@ -150,7 +155,7 @@ async function mergeDomTests(host, domTests) {
   if (!host) return { error: "no host" };
   const root = getRootDomain(host);
   const ageTest = await testDomainAge(root);
-  const domainAgeDays = parseAgeDays(ageTest);
+  const domainAgeDays = parseAgeDays(ageTest) ?? (isPopularRoot(root) ? 400 : null);
   const hasLoginForms = Array.isArray(domTests)
     && domTests.some((t) => t && t.name === "Form Action Audit" && !t.skipped);
   const network = await Promise.all([
@@ -164,6 +169,7 @@ async function mergeDomTests(host, domTests) {
     testTyposquat(root, domainAgeDays),
     testFaviconPhash(root, domainAgeDays),
     testHighRiskDomain(root, domainAgeDays),
+    testBrandSubdomain(host),
     testBackend(root),
     testEmailAuth(root, { domainAgeDays, hasLoginForms }),
     Promise.resolve({ name: "HTTPS Enabled", passed: true, weight: 0, reason: "Page loaded over HTTPS", evidence: "scheme=https" }),

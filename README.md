@@ -27,6 +27,7 @@ Start at 100. Each test either passes (no change) or fails (subtracts its weight
 | Domain | SSL Certificate Age | crt.sh (4s timeout) | Free |
 | Domain | Homoglyph / Punycode | local | Free |
 | Domain | High-Risk TLD / Naming | local heuristics | Free |
+| Domain | Brand in Subdomain | local (brand list + popular-domain allowlist) | Free |
 | Brand | Typosquat / Spelling Trick | Levenshtein vs 291-brand list | Free, local |
 | Brand | Favicon Brand Match | local 8x8 aHash + hue histogram + edge hash | Free, local |
 | Email | Email Authentication (MX/SPF/DMARC) | DoH TXT/MX | Free |
@@ -67,6 +68,8 @@ node extension/tests/check_typosquat.mjs
 node extension/tests/check_homoglyph.mjs
 node extension/tests/check_brands.mjs
 node extension/tests/check_display_name.mjs
+node extension/tests/check_display_extract.mjs
+node extension/tests/check_brand_subdomain.mjs
 node extension/tests/check_composite.mjs
 node extension/tests/check_history_rotation.mjs
 node extension/tests/check_disposable.mjs
@@ -148,6 +151,8 @@ extension/
     test_favicon.js        # aHash + hue + edge hash brand clone detection
     test_homoglyph.js      # xn-- + non-ASCII lookalikes
     test_highrisk.js       # high-risk TLD + piracy keywords
+    test_brand_subdomain.js # paypal.com.evil.tk shape — brand in subdomain label
+    popular.js             # popular-domain allowlist (FPR guard + heuristic skip)
     composite.js           # DNSSEC + SPF + DMARC aggregate signal
     history_rotation.js    # same fingerprint on multiple hosts
     brands.js              # 291-brand curated list

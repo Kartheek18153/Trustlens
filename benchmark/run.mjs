@@ -8,10 +8,12 @@
 // Output: per-config confusion matrix, recall, FPR, F1, accuracy.
 
 import { getRootDomain, isValidDomain, isCheckableHost } from "../extension/background/domain.js";
+import { isPopularRoot } from "../extension/background/popular.js";
 import { testDomainAge, testRegistrarReputation, testCertAge, testTyposquat, testEmailAuth, testDisposableEmailDomain, testDisplayNameMismatch, computeSpoofIndex, displayNameSignals } from "../extension/background/tests.js";
 import { testDnssec, testCrossResolver } from "../extension/background/test_dnssec.js";
 import { testHomoglyph } from "../extension/background/test_homoglyph.js";
 import { testHighRiskDomain } from "../extension/background/test_highrisk.js";
+import { testBrandSubdomain } from "../extension/background/test_brand_subdomain.js";
 import { aggregate } from "../extension/background/score.js";
 import { compositeSignals } from "../extension/background/composite.js";
 import { LABELED, getByLabel } from "./corpus.mjs";
@@ -225,7 +227,7 @@ async function runAllForHost(host, url, opts = {}) {
     : { name: "HTTPS Enabled", passed: false, weight: 25, reason: "Site is not using HTTPS", evidence: url || host };
 
   const ageTest = await testDomainAge(root);
-  const domainAgeDays = parseAgeDays(ageTest);
+  const domainAgeDays = parseAgeDays(ageTest) ?? (isPopularRoot(root) ? 400 : null);
 
   const network = await Promise.all([
     testDnssec(root),
@@ -236,6 +238,7 @@ async function runAllForHost(host, url, opts = {}) {
     testCertAge(root),
     testTyposquat(root, domainAgeDays),
     testHighRiskDomain(root, domainAgeDays),
+    testBrandSubdomain(host),
     Promise.resolve(httpsTest),
   ]);
 

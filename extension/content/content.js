@@ -63,34 +63,53 @@ function escapeHtml(s) {
 
 function extractEmails() {
   const found = new Set();
-  if (!document.body) return [];
+  const displayNames = new Map(); // address -> display name (first seen)
+  if (!document.body) return { emails: [], displayNames };
   try {
+    // mailto anchors: text content or title often carries the display name.
+    document.querySelectorAll('a[href^="mailto:"]').forEach((a) => {
+      const address = a.getAttribute("href").slice(7).split("?")[0];
+      if (!address) return;
+      found.add(address);
+      const dn = (a.textContent || "").trim() || (a.title || "").trim();
+      if (dn && dn !== address && !displayNames.has(address)) {
+        displayNames.set(address, dn);
+      }
+    });
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
     let node;
     while ((node = walker.nextNode())) {
-      const matches = node.nodeValue && node.nodeValue.match(EMAIL_RE);
-      if (matches) matches.forEach((m) => found.add(m));
+      const value = node.nodeValue || "";
+      const matches = value.match(EMAIL_RE);
+      if (!matches) continue;
+      for (const m of matches) {
+        found.add(m);
+        // "Display Name <addr>" pattern in visible text. The regex grabs the
+        // full prefix ("Contact PayPal Support <") — keep only the trailing
+        // 3 words, spoof display names are short ("PayPal Support",
+        // "Microsoft Security Team").
+        const before = value.slice(0, value.indexOf(m)).trim();
+        const dnMatch = before.match(/([A-Za-z][A-Za-z0-9.'-]*(?:\s+[A-Za-z][A-Za-z0-9.'-]*)*)\s*<$/);
+        if (dnMatch && !displayNames.has(m)) {
+          const words = dnMatch[1].trim().split(/\s+/);
+          displayNames.set(m, words.slice(-3).join(" "));
+        }
+      }
     }
   } catch (e) { /* ignore */ }
-  try {
-    document.querySelectorAll('a[href^="mailto:"]').forEach((a) => {
-      const m = a.getAttribute("href").slice(7).split("?")[0];
-      if (m) found.add(m);
-    });
-  } catch (e) { /* ignore */ }
-  return [...found];
+  return { emails: [...found], displayNames };
 }
 
 async function scanEmails() {
   if (!isCheckable) return;
-  const emails = extractEmails();
+  const { emails, displayNames } = extractEmails();
   for (const address of emails) {
     if (SCANNED.has(address)) continue;
     SCANNED.add(address);
     try {
       const res = await chrome.runtime.sendMessage({
         type: "scoreEmail",
-        email: { displayName: null, address },
+        email: { displayName: displayNames.get(address) || null, address },
       });
       if (res && (res.verdict === "Dangerous" || res.verdict === "Caution")) {
         highlightEmails(address, res.verdict);
