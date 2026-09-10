@@ -1,0 +1,22 @@
+.trustlens-banner {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 2147483647;
+  background: #dc2626;
+  color: #fff;
+  font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+}
+.trustlens-banner-inner {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 14px; max-width: 1200px; margin: 0 auto;
+}
+.trustlens-banner-title { font-weight: 700; }
+.trustlens-banner-body { flex: 1; }
+.trustlens-banner-actions button {
+  background: rgba(255,255,255,0.15); color: #fff; border: 0;
+  padding: 6px 10px; border-radius: 4px; cursor: pointer;
+}
+.trustlens-banner-actions button:hover { background: rgba(255,255,255,0.25); }
+.trustlens-email.dangerous { color: inherit; }
+.trustlens-email.caution   { color: inherit; }

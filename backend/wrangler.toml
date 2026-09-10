@@ -1,0 +1,23 @@
+# wrangler.toml — Cloudflare Worker config for TrustLens backend
+# 1. `wrangler kv:namespace create REPUTATION` → paste the returned id below
+# 2. Set INGEST_TOKEN and REPORT_TOKEN as Worker secrets:
+#      wrangler secret put INGEST_TOKEN
+#      wrangler secret put REPORT_TOKEN
+# 3. `wrangler deploy`
+#
+# Free tier covers ~100k requests/day and 100k KV reads/day, which is
+# enough for a personal extension plus crawler.
+
+name = "trustlens-backend"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+[observability]
+enabled = true
+
+[[kv_namespaces]]
+binding = "REPUTATION"
+id = "a388ab74a0904bd787d2418197060c86"
+
+[vars]
+# Add non-secret config here if needed.

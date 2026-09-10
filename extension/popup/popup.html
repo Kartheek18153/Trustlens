@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>TrustLens</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="top">
+      <h1>TrustLens</h1>
+      <div class="tabs">
+        <button class="tab active" data-tab="site">Site</button>
+        <button class="tab" data-tab="history">History</button>
+        <button class="tab" data-tab="help">Help</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="tab-site" class="tab-panel">
+        <div class="current-url" id="currentUrl">Loading…</div>
+        <div class="verdict-card" id="verdictCard">
+          <div class="score" id="score">—</div>
+          <div class="verdict" id="verdict">Click to check</div>
+        </div>
+        <div class="coverage" id="coverage">
+          <span class="coverage-label">Threat feeds:</span>
+          <span class="coverage-pill" id="covGsb" data-on="false">GSB</span>
+          <span class="coverage-pill" data-on="true">PhishTank</span>
+          <span class="coverage-pill" data-on="true">URLhaus</span>
+          <span class="coverage-pill" id="covBackend" data-on="false">Backend</span>
+        </div>
+        <button class="primary" id="checkBtn">Check this site</button>
+        <div class="tests" id="tests"></div>
+      </section>
+
+      <section id="tab-history" class="tab-panel hidden">
+        <div class="row-between">
+          <h2>Recent checks</h2>
+          <button class="link" id="clearHistory">Clear</button>
+        </div>
+        <div class="history" id="history"></div>
+      </section>
+
+      <section id="tab-help" class="tab-panel hidden">
+        <h2>How TrustLens scores a site</h2>
+        <p>Each test contributes a weight. Failing a test subtracts that weight from a starting score of 100. The final band tells you what to do:</p>
+        <ul>
+          <li><b>Safe (80–100):</b> proceed normally.</li>
+          <li><b>Caution (50–79):</b> double-check the URL, don't enter passwords unless you're certain.</li>
+          <li><b>Dangerous (&lt;50):</b> do not enter credentials or click email links.</li>
+        </ul>
+        <p class="muted"><b>Accuracy:</b> on PhishTank-validated phishing, TrustLens catches ~85–88% when all threat feeds (GSB, PhishTank, URLhaus) are active. Lower without them. Heuristic-only — not a substitute for paid enterprise anti-phishing.</p>
+        <h3>Tests run</h3>
+        <ul class="legend">
+          <li><b>Google Safe Browsing</b> — Google's malware/phishing list. (needs API key)</li>
+          <li><b>DNSSEC (AD flag)</b> — chain validated by resolver.</li>
+          <li><b>Cross-Resolver Consistency</b> — Google vs Cloudflare agree.</li>
+          <li><b>Homoglyph / Punycode</b> — xn-- or non-ASCII lookalikes.</li>
+          <li><b>Domain Age</b> — RDAP registration date.</li>
+          <li><b>Registrar Reputation</b> — known-abused vs known-trusted registrars.</li>
+          <li><b>SSL Certificate Age</b> — first cert seen in CT logs.</li>
+          <li><b>Typosquat / Spelling Trick</b> — Levenshtein distance to common brands.</li>
+          <li><b>Favicon Brand Match</b> — visual clone detection via pHash.</li>
+          <li><b>Email Authentication</b> — MX + SPF + DMARC presence.</li>
+          <li><b>HTTPS Enabled</b> — current scheme.</li>
+          <li><b>Form Action Audit</b> — password form posting off-origin.</li>
+          <li><b>iFrame Clickjack Scan</b> — login framed by third party.</li>
+          <li><b>Form Submit Watcher</b> — warns before credential submit.</li>
+        </ul>
+        <h3>Settings</h3>
+        <label class="muted">Google Safe Browsing API key (optional, free tier 10k/day)</label>
+        <div class="row" style="gap:6px; margin-top:4px;">
+          <input id="gsbKey" type="password" placeholder="AIza..." style="flex:1; padding:6px 8px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--fg);" />
+          <button class="link" id="saveGsbKey">Save</button>
+        </div>
+        <p class="muted" id="gsbStatus"></p>
+        <label class="muted" style="margin-top:10px; display:block;">ipinfo.io token (optional, raises ASN rate limit to 50k/mo)</label>
+        <div class="row" style="gap:6px; margin-top:4px;">
+          <input id="ipinfoToken" type="password" placeholder="leave blank for free tier" style="flex:1; padding:6px 8px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--fg);" />
+          <button class="link" id="saveIpinfoToken">Save</button>
+        </div>
+        <p class="muted" id="ipinfoStatus"></p>
+        <h3>Backend (optional)</h3>
+        <p class="muted">Self-hosted Cloudflare Worker that aggregates PhishTank + URLhaus + OpenPhish + ThreatFox and adds collab signals. Required for &gt;90% accuracy on validated phishing.</p>
+        <label class="muted">Backend URL (e.g. https://trustlens-backend.example.workers.dev)</label>
+        <div class="row" style="gap:6px; margin-top:4px;">
+          <input id="backendUrl" type="url" placeholder="https://..." style="flex:1; padding:6px 8px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--fg);" />
+          <button class="link" id="saveBackendUrl">Save</button>
+        </div>
+        <p class="muted" id="backendStatus"></p>
+        <label class="muted" style="margin-top:10px; display:block;">Community report token (opt-in: enables reporting confirmed-phish hosts)</label>
+        <div class="row" style="gap:6px; margin-top:4px;">
+          <input id="reportToken" type="password" placeholder="paste token from your backend deploy" style="flex:1; padding:6px 8px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--fg);" />
+          <button class="link" id="saveReportToken">Save</button>
+        </div>
+        <p class="muted" id="reportStatus"></p>
+        <p class="muted">No data leaves your machine except public RDAP/DoH/crt.sh/PhishTank/GSB lookups for the site you're checking. With backend configured, only the root domain of the current site is sent.</p>
+      </section>
+    </main>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

@@ -1,0 +1,17 @@
+{
+  "name": "trustlens-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "worker.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "crawl": "node crawler.js",
+    "test": "node tests/check_backend.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^3.78.0"
+  }
+}
