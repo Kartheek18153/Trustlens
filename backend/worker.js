@@ -21,6 +21,31 @@ const SCORE_TTL_SECONDS = 5 * 60;
 const ASN_TTL_SECONDS = 24 * 60 * 60;
 const CT_TTL_SECONDS = 24 * 60 * 60;
 
+// Rate limit for the tokenless public endpoints (/score /asn /ct).
+// In-memory per-isolate: KV writes would cost more than the abuse they
+// prevent, and per-isolate limiting stops the obvious quota-burner.
+// ponytail: not global across isolates — add a KV/Durable Object counter
+// if a single client still manages to burn the upstream quota.
+const RL_WINDOW_MS = 60_000;
+const RL_MAX = 30; // per IP per minute
+const rlBuckets = new Map(); // ip -> { count, resetAt }
+
+function rateLimited(request) {
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  const now = Date.now();
+  let b = rlBuckets.get(ip);
+  if (!b || now > b.resetAt) {
+    b = { count: 0, resetAt: now + RL_WINDOW_MS };
+    rlBuckets.set(ip, b);
+    // Bound the map: drop expired buckets when it grows.
+    if (rlBuckets.size > 10_000) {
+      for (const [k, v] of rlBuckets) if (now > v.resetAt) rlBuckets.delete(k);
+    }
+  }
+  b.count++;
+  return b.count > RL_MAX;
+}
+
 const SOURCES = {
   phishtank: { weight: 55, name: "PhishTank" },
   urlhaus:   { weight: 55, name: "URLhaus" },
@@ -156,11 +181,13 @@ async function handleIngest(request, env) {
   let written = 0;
   let skipped = 0;
   const batch = [];
+  const roots = new Set();
   for (const e of entries) {
     if (!e || typeof e.host !== "string" || typeof e.source !== "string") { skipped++; continue; }
     const root = rootDomainOf(e.host);
     if (!isValidDomain(root)) { skipped++; continue; }
     if (!SOURCES[e.source]) { skipped++; continue; }
+    roots.add(root);
     batch.push(mergeHost(env, root, e.source, e.firstSeen));
     written++;
     if (batch.length >= 50) {
@@ -168,6 +195,9 @@ async function handleIngest(request, env) {
     }
   }
   if (batch.length > 0) await Promise.all(batch);
+  // Invalidate score caches for newly-listed hosts — otherwise /score serves
+  // "not listed" for up to 5 minutes after the feed sees the host.
+  await Promise.all([...roots].map((r) => env.REPUTATION.delete(`score:${r}`).catch(() => {})));
   return jsonResponse({ written, skipped });
 }
 
@@ -185,20 +215,27 @@ async function handleReport(request, env) {
   if (!isValidDomain(root)) {
     return jsonResponse({ error: "Invalid host" }, 400);
   }
+  // Merge collab source + increment report count in ONE write. The old code
+  // read, merged, then wrote stale data — clobbering the collab entry it
+  // just added and any source that landed in between (lost-update race).
   const existing = await readHost(env, root);
-  const sources = existing && Array.isArray(existing.sources) ? existing.sources : [];
-  // Require a minimum report count before treating as collab signal.
-  const reports = (existing && existing.reports) || 0;
-  await mergeHost(env, root, "collab", Date.now());
-  await writeHost(env, root, { sources, reports: reports + 1, lastSeen: Date.now() });
-  // Mark collab listing only after ≥3 independent reports.
-  if (reports + 1 >= 3) {
+  const sources = existing && Array.isArray(existing.sources) ? [...existing.sources] : [];
+  if (!sources.find((s) => s.name === "collab")) {
+    sources.push({ name: "collab", firstSeen: Date.now() });
+  }
+  const reports = ((existing && existing.reports) || 0) + 1;
+  await writeHost(env, root, { sources, reports, lastSeen: Date.now() });
+  // Mark collab listing only after ≥3 independent reports. Invalidate the
+  // score cache so the next /score sees the new state.
+  if (reports >= 3) {
     await env.REPUTATION.put(`score:${root}`, JSON.stringify({
       host: root, listed: true, weight: SOURCES.collab.weight + 20,
-      sources: ["collab"], timestamp: Date.now(),
+      sources: sources.map((s) => s.name), timestamp: Date.now(),
     }), { expirationTtl: SCORE_TTL_SECONDS });
+  } else {
+    await env.REPUTATION.delete(`score:${root}`);
   }
-  return jsonResponse({ ok: true, reports: reports + 1 });
+  return jsonResponse({ ok: true, reports });
 }
 
 function handleHealth() {
@@ -331,12 +368,17 @@ export default {
     }
     const url = new URL(request.url);
     try {
+      if (url.pathname === "/health") return handleHealth();
+      // Public endpoints are rate-limited; tokened ones (/ingest /report)
+      // police themselves via their tokens.
+      if (url.pathname === "/score" || url.pathname === "/asn" || url.pathname === "/ct") {
+        if (rateLimited(request)) return jsonResponse({ error: "Rate limited" }, 429);
+      }
       if (url.pathname === "/score" && request.method === "POST") return await handleScore(request, env);
       if (url.pathname === "/ingest" && request.method === "POST") return await handleIngest(request, env);
       if (url.pathname === "/report" && request.method === "POST") return await handleReport(request, env);
       if (url.pathname === "/asn" && request.method === "POST") return await handleAsn(request, env);
       if (url.pathname === "/ct" && request.method === "POST") return await handleCt(request, env);
-      if (url.pathname === "/health") return handleHealth();
       return jsonResponse({ error: "Not found" }, 404);
     } catch (e) {
       return jsonResponse({ error: e.message || "Internal error" }, 500);

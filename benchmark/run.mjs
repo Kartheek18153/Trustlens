@@ -161,6 +161,12 @@ function stubFetch(url, opts = {}) {
       answer = FULL_AUTH.has(root)
         ? [{ type: 16, data: '"v=DMARC1; p=reject"' }]
         : [];
+    } else if (queriedName.includes("._domainkey")) {
+      // DKIM selectors: full-auth providers have one, others don't.
+      const root = queriedName.split("._domainkey.")[1] || "";
+      answer = FULL_AUTH.has(root)
+        ? [{ type: 16, data: '"v=DKIM1; k=rsa; p=MIIBIjANBgk"' }]
+        : [];
     } else {
       const root = queriedName;
       answer = FULL_AUTH.has(root)

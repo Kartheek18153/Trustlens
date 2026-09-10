@@ -1,6 +1,7 @@
 // Self-check for backend domain normalization + aggregator + new /asn /ct routes.
 // Run with: node tests/check_backend.mjs
 import { rootDomainOf, isValidDomain, aggregateFromSources, SOURCES, handleAsn, handleCt } from "../worker.js";
+import worker from "../worker.js";
 
 function expect(label, got, want) {
   const ok = got === want;
@@ -36,8 +37,14 @@ function makeEnv() {
   const store = new Map();
   return {
     REPUTATION: {
-      async get(key) { return store.has(key) ? store.get(key) : null; },
+      // Honor the KV "json" read type like real KV does.
+      async get(key, type) {
+        if (!store.has(key)) return null;
+        const v = store.get(key);
+        return type === "json" ? JSON.parse(v) : v;
+      },
       async put(key, value) { store.set(key, value); },
+      async delete(key) { store.delete(key); },
     },
     _store: store,
   };
@@ -150,4 +157,68 @@ async function withStubbedFetch(statusCode, run) {
     await handleCt(await ctReq({ domain: "noauth.example" }), env);
     expect("/ct certspotter uses no auth", sentAuth, false);
   } finally { globalThis.fetch = orig; }
+}
+
+// --- /report: collab entry must survive its own write (lost-update race) ---
+// The old implementation merged "collab" then wrote back the STALE sources
+// array — the collab entry vanished. Reproduce with a plain in-memory KV.
+{
+  const store = new Map();
+  const env = {
+    REPUTATION: {
+      async get(key, type) {
+        if (!store.has(key)) return null;
+        const v = store.get(key);
+        return type === "json" ? JSON.parse(v) : v;
+      },
+      async put(key, value) { store.set(key, value); },
+      async delete(key) { store.delete(key); },
+    },
+    REPORT_TOKEN: "tok",
+    _store: store,
+  };
+  const req = (host = "race.example") => new Request("https://x/report", {
+    method: "POST",
+    headers: { "X-TrustLens-Token": "tok" },
+    body: JSON.stringify({ host }),
+  });
+  // Seed: host already listed by phishtank.
+  store.set("host:race.example", JSON.stringify({
+    sources: [{ name: "phishtank", firstSeen: 1 }], lastSeen: 1,
+  }));
+  const res = await worker.fetch(req("race.example"), env, {});
+  expect("/report returns 200", res.status, 200);
+  const body = await res.json();
+  expect("/report reports=1", body.reports, 1);
+  const stored = JSON.parse(store.get("host:race.example"));
+  const names = (stored.sources || []).map((s) => s.name);
+  expect("/report collab survives write", names.includes("collab"), true);
+  expect("/report phishtank survives too", names.includes("phishtank"), true);
+  expect("/report reports persisted", stored.reports, 1);
+
+  // Three reports → collab listing lands in the score cache.
+  await worker.fetch(req("race.example"), env, {});
+  await worker.fetch(req("race.example"), env, {});
+  const score = JSON.parse(store.get("score:race.example"));
+  expect("/report 3 reports marks listed", score.listed, true);
+  expect("/report listed weight boosted", score.weight, SOURCES.collab.weight + 20);
+}
+
+// --- rate limit: 30th request in a minute from one IP passes, 31st 429s ---
+{
+  const env = makeEnv();
+  const req = () => new Request("https://x/score", {
+    method: "POST",
+    body: JSON.stringify({ host: "rl.example" }),
+    headers: { "CF-Connecting-IP": "9.9.9.9" },
+  });
+  let saw429 = false;
+  let lastStatus = null;
+  for (let i = 0; i < 35; i++) {
+    const res = await worker.fetch(req(), env, {});
+    lastStatus = res.status;
+    if (res.status === 429) { saw429 = true; break; }
+  }
+  expect("rate limit fires by 31st call", saw429, true);
+  expect("rate limited status 429", lastStatus, 429);
 }

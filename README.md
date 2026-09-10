@@ -22,15 +22,16 @@ Start at 100. Each test either passes (no change) or fails (subtracts its weight
 | Network | DNSSEC (AD flag) | DoH `dns.google` | Free |
 | Network | Cross-Resolver Consistency | DoH Google vs Cloudflare, then ASN compare via ipinfo.io (HTTPS) | Free (50k/mo, optional token raises limit) |
 | Network | Unsigned Composite | DNSSEC + SPF + DMARC aggregate | Free |
-| Domain | Domain Age | RDAP (4s timeout) | Free |
-| Domain | Registrar Reputation | RDAP (4s timeout) | Free |
+| Domain | Domain Age | RDAP (4s timeout, 10min shared cache) | Free |
+| Domain | Registrar Reputation | RDAP (shared cache) | Free |
 | Domain | SSL Certificate Age | crt.sh (4s timeout) | Free |
 | Domain | Homoglyph / Punycode | local | Free |
 | Domain | High-Risk TLD / Naming | local heuristics | Free |
 | Domain | Brand in Subdomain | local (brand list + popular-domain allowlist) | Free |
 | Brand | Typosquat / Spelling Trick | Levenshtein vs 291-brand list | Free, local |
 | Brand | Favicon Brand Match | local 8x8 aHash + hue histogram + edge hash | Free, local |
-| Email | Email Authentication (MX/SPF/DMARC) | DoH TXT/MX | Free |
+| Email | Email Authentication (MX/SPF/DMARC/DKIM) | DoH TXT/MX | Free |
+| Email | Email Policy Strength | SPF -all vs +all, DMARC p=reject vs p=none | Free |
 | Email | Disposable Email Provider | disposable-email-domains blocklist, 7d cached | Free |
 | Email | Display Name Mismatch | token + year/numeric heuristic | Free, local |
 | DOM | HTTPS Enabled | URL scheme | Free |
@@ -66,6 +67,7 @@ Each test card in the popup shows its name, Pass/Fail/Skip badge, the penalty it
 node extension/tests/check_score.mjs
 node extension/tests/check_typosquat.mjs
 node extension/tests/check_homoglyph.mjs
+node extension/tests/check_punycode.mjs
 node extension/tests/check_brands.mjs
 node extension/tests/check_display_name.mjs
 node extension/tests/check_display_extract.mjs
@@ -142,7 +144,8 @@ extension/
   background/
     sw.js                  # service worker — orchestrates everything
     score.js               # aggregate(tests) -> { score, verdict, tests }
-    tests.js               # domain age, registrar, cert age, typosquat, email auth, disposable, display-name
+    tests.js               # domain age, registrar, cert age, typosquat, email auth (+ policy strength), disposable, display-name
+    rdap.js                # shared RDAP client with chrome.storage cache (age + registrar reuse one fetch)
     test_safebrowsing.js   # GSB v4 (uses stored API key)
     test_phishtank.js      # PhishTank dump, 24h cached (legacy — backend preferred)
     test_urlhaus.js        # URLhaus recent, 24h cached (legacy — backend preferred)

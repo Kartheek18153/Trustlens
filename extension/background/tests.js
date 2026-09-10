@@ -8,8 +8,9 @@ import { BRANDS as BIG_BRANDS } from "./brands.js";
 import { isDisposable } from "./disposable.js";
 import { getBackendUrl } from "./backend.js";
 import { isPopularRoot } from "./popular.js";
+import { fetchRdap } from "./rdap.js";
 
-// --- 1. Domain age (RDAP) ---
+// --- 1. Domain age (RDAP, shared cache — registrar test reuses the same fetch) ---
 async function testDomainAge(host) {
   const name = "Domain Age";
   const domain = getRootDomain(host);
@@ -21,32 +22,22 @@ async function testDomainAge(host) {
   if (isPopularRoot(domain)) {
     return { name, passed: true, weight: 0, reason: `Well-known domain — age check skipped`, evidence: domain, skipped: true };
   }
-  try {
-    const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(), 4000);
-    let res;
-    try {
-      res = await fetch(`https://rdap.org/domain/${encodeURIComponent(domain)}`, { signal: controller.signal });
-    } finally { clearTimeout(tid); }
-    if (!res.ok) {
-      // Soft fail — lookup is unavailable, but it doesn't mean the site is safe.
-      return { name, passed: false, weight: 8, reason: `RDAP lookup unavailable (HTTP ${res.status})`, evidence: String(res.status) };
-    }
-    const data = await res.json();
-    const ev = data.events || [];
-    const created = ev.find((e) => e.eventAction === "registration")?.eventDate
-                 || ev.find((e) => e.eventAction === "creation")?.eventDate;
-    if (!created) {
-      return { name, passed: true, weight: 0, reason: "No creation date in RDAP", evidence: "", skipped: true };
-    }
-    const days = Math.floor((Date.now() - new Date(created).getTime()) / 86400000);
-    if (days < 30)  return { name, passed: false, weight: 35, reason: `Registered ${days} days ago`, evidence: created };
-    if (days < 180) return { name, passed: false, weight: 20, reason: `Registered ${days} days ago`, evidence: created };
-    if (days < 365) return { name, passed: true,  weight: 0,  reason: `Registered ${days} days ago (young)`, evidence: created };
-    return { name, passed: true, weight: 0, reason: `Registered ${days} days ago`, evidence: created };
-  } catch (e) {
-    return { name, passed: false, weight: 8, reason: "RDAP lookup failed", evidence: e.message };
+  const data = await fetchRdap(domain);
+  if (data.__error) {
+    // Soft fail — lookup is unavailable, but it doesn't mean the site is safe.
+    return { name, passed: false, weight: 8, reason: `RDAP lookup unavailable (${data.__error})`, evidence: data.__error };
   }
+  const ev = data.events || [];
+  const created = ev.find((e) => e.eventAction === "registration")?.eventDate
+               || ev.find((e) => e.eventAction === "creation")?.eventDate;
+  if (!created) {
+    return { name, passed: true, weight: 0, reason: "No creation date in RDAP", evidence: "", skipped: true };
+  }
+  const days = Math.floor((Date.now() - new Date(created).getTime()) / 86400000);
+  if (days < 30)  return { name, passed: false, weight: 35, reason: `Registered ${days} days ago`, evidence: created };
+  if (days < 180) return { name, passed: false, weight: 20, reason: `Registered ${days} days ago`, evidence: created };
+  if (days < 365) return { name, passed: true,  weight: 0,  reason: `Registered ${days} days ago (young)`, evidence: created };
+  return { name, passed: true, weight: 0, reason: `Registered ${days} days ago`, evidence: created };
 }
 
 // --- 2. Registrar reputation ---
@@ -82,28 +73,18 @@ async function testRegistrarReputation(host) {
   if (isPopularRoot(domain)) {
     return { name, passed: true, weight: 0, reason: `Well-known domain — registrar check skipped`, evidence: domain, skipped: true };
   }
-  try {
-    const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(), 4000);
-    let res;
-    try {
-      res = await fetch(`https://rdap.org/domain/${encodeURIComponent(domain)}`, { signal: controller.signal });
-    } finally { clearTimeout(tid); }
-    if (!res.ok) {
-      return { name, passed: false, weight: 5, reason: `RDAP lookup unavailable (HTTP ${res.status})`, evidence: String(res.status) };
-    }
-    const data = await res.json();
-    const registrar = data.entities?.find((e) => e.roles?.includes("registrar"))?.vcardArray?.[1]?.find((f) => f[0] === "fn")?.[3] || "Unknown";
-    if (TRUSTED_REGISTRARS.has(registrar)) {
-      return { name, passed: true, weight: 0, reason: `Trusted registrar: ${registrar}`, evidence: registrar };
-    }
-    if (ABUSED_REGISTRARS.has(registrar)) {
-      return { name, passed: false, weight: 10, reason: `Registrar frequently abused: ${registrar}`, evidence: registrar };
-    }
-    return { name, passed: true, weight: 0, reason: `Registrar: ${registrar}`, evidence: registrar };
-  } catch (e) {
-    return { name, passed: false, weight: 5, reason: "RDAP lookup failed", evidence: e.message };
+  const data = await fetchRdap(domain);
+  if (data.__error) {
+    return { name, passed: false, weight: 5, reason: `RDAP lookup unavailable (${data.__error})`, evidence: data.__error };
   }
+  const registrar = data.entities?.find((e) => e.roles?.includes("registrar"))?.vcardArray?.[1]?.find((f) => f[0] === "fn")?.[3] || "Unknown";
+  if (TRUSTED_REGISTRARS.has(registrar)) {
+    return { name, passed: true, weight: 0, reason: `Trusted registrar: ${registrar}`, evidence: registrar };
+  }
+  if (ABUSED_REGISTRARS.has(registrar)) {
+    return { name, passed: false, weight: 10, reason: `Registrar frequently abused: ${registrar}`, evidence: registrar };
+  }
+  return { name, passed: true, weight: 0, reason: `Registrar: ${registrar}`, evidence: registrar };
 }
 
 // --- 3. SSL certificate age via backend /ct ---
@@ -213,13 +194,49 @@ async function testTyposquat(host, domainAgeDays) {
   return { name, passed: true, weight: 0, reason: "No known brand match", evidence: sld };
 }
 
-// --- 5. Email authentication (MX + SPF + DMARC) ---
-// Two new rules:
+// --- 5. Email authentication (MX + SPF + DMARC, policy-strength weighted) ---
+// Rules:
 //  1. If the site has no login forms AND the domain is > 365 days old,
 //     email-auth issues are informational only (weight 0) — they affect
 //     a separate "Email Spoofability Index" reported in evidence.
 //  2. Even on a site with login forms, an old domain (>365d) missing only
 //     DMARC carries 0 weight (don't drop Safe -> Caution just for that).
+//  3. Presence is NOT protection: p=none DMARC and "v=spf1 +all" are
+//     cosmetic. Policy strength scales the spoofability index and the weight.
+
+// DMARC policy strength: p=reject > quarantine > none/missing.
+function dmarcStrength(record) {
+  if (!record) return 0;
+  const p = (record.match(/\bp\s*=\s*(none|quarantine|reject)/i) || [])[1];
+  if (!p) return 0; // malformed record, treat as absent
+  const s = p.toLowerCase();
+  if (s === "reject") return 3;
+  if (s === "quarantine") return 2;
+  return 1; // p=none — monitor-only, spoofing still deliverable
+}
+
+// SPF strength: -all (hard fail) > ~all (soft) > ?all (neutral) > +all (pass everything).
+function spfStrength(record) {
+  if (!record) return 0;
+  const m = record.match(/(^|\s)([+~?-])all(\s|$)/);
+  if (!m) return 0;
+  const mech = m[2];
+  if (mech === "-") return 3;
+  if (mech === "~") return 2;
+  if (mech === "?") return 1;
+  return 0; // +all — explicitly passes everyone, worse than none
+}
+
+// Full spoofability index 0-100: MX 25, SPF up to 25, DMARC up to 50.
+function computeSpoofIndex({ mx, spfRecord, dmarcRecord, dkim }) {
+  let score = 0;
+  if (mx) score += 25;
+  score += spfStrength(spfRecord) * 8;   // 0..24, +all gets 0
+  score += dmarcStrength(dmarcRecord) * 16; // 0..48, p=none gets 16, reject 48
+  if (dkim) score += 10; // capped so the index tops out at 100
+  return Math.min(100, score);
+}
+
 async function testEmailAuth(host, opts) {
   const name = "Email Authentication";
   const domain = getRootDomain(host);
@@ -228,7 +245,7 @@ async function testEmailAuth(host, opts) {
   if (!isValidDomain(domain)) {
     return { name, passed: false, weight: 25, reason: "Invalid domain for email check", evidence: domain };
   }
-  const results = { mx: null, spf: null, dmarc: null };
+  const results = { mx: null, spf: null, dmarc: null, dkim: null };
   try {
     const mx = await dohMx(domain);
     results.mx = mx;
@@ -241,25 +258,39 @@ async function testEmailAuth(host, opts) {
     const txt = await dohTxt(`_dmarc.${domain}`);
     results.dmarc = txt.find((t) => t.toLowerCase().startsWith("v=dmarc1")) || null;
   } catch { results.dmarc = null; }
+  // DKIM presence: common selector names under _domainkey, probed in
+  // parallel. A hit means the domain can sign; spoofers rarely publish DKIM.
+  try {
+    const selectors = ["default", "selector1", "selector2", "s1", "s2", "k1", "google", "dkim"];
+    const probes = await Promise.all(selectors.map((sel) =>
+      dohTxt(`${sel}._domainkey.${domain}`).catch(() => [])
+    ));
+    const hit = probes.findIndex((txt) => txt && txt.length > 0);
+    if (hit > -1) results.dkim = `${selectors[hit]}._domainkey`;
+  } catch { /* none */ }
 
   const issues = [];
   if (!results.mx || results.mx.length === 0) issues.push("no MX records");
   if (!results.spf) issues.push("no SPF");
+  else if (spfStrength(results.spf) === 0) issues.push("SPF ends in +all (passes everyone)");
   if (!results.dmarc) issues.push("no DMARC");
+  else if (dmarcStrength(results.dmarc) === 1) issues.push("DMARC p=none (monitor-only)");
 
   if (issues.length === 0) {
-    return { name, passed: true, weight: 0, reason: "MX + SPF + DMARC all present", evidence: `${results.mx.length} MX` };
+    return { name, passed: true, weight: 0, reason: "MX + strong SPF + enforced DMARC", evidence: `${results.mx.length} MX` };
   }
 
-  // Context-aware gating:
-  // - No login form on the page + old domain -> informational only.
-  // - Old domain + only DMARC missing -> no penalty.
-  // - Otherwise -> existing penalty weights.
   const oldDomain = typeof domainAgeDays === "number" && domainAgeDays > 365;
   const onlyDmarcMissing = issues.length === 1 && issues[0] === "no DMARC";
   const webOnlyNoLogin = !hasLogin && !results.mx.length; // not even an MX -> likely a pure web domain
 
-  const emailSpoofIndex = computeSpoofIndex({ mx: !!results.mx?.length, spf: !!results.spf, dmarc: !!results.dmarc });
+  const emailSpoofIndex = computeSpoofIndex({
+    mx: !!results.mx?.length,
+    spfRecord: results.spf,
+    dmarcRecord: results.dmarc,
+    dkim: results.dkim,
+  });
+  const spoofTag = `Email Spoofability Index: ${emailSpoofIndex}/100`;
 
   if (webOnlyNoLogin || (oldDomain && onlyDmarcMissing)) {
     return {
@@ -267,27 +298,24 @@ async function testEmailAuth(host, opts) {
       passed: true,
       weight: 0,
       reason: `Email issues noted but not penalized: ${issues.join(", ")} (no login form${oldDomain ? ", old domain" : ""})`,
-      evidence: `Email Spoofability Index: ${emailSpoofIndex}/100`,
+      evidence: spoofTag,
       spoofIndex: emailSpoofIndex,
     };
   }
+  // Weak policies carry more weight than plain absence on login-form sites:
+  // a phishing kit on a login page with +all SPF / p=none DMARC is hostile
+  // infrastructure, not just a lazy sysadmin.
+  const weakPolicy = issues.some((i) => i.includes("+all") || i.includes("p=none"));
+  if (weakPolicy && hasLogin) {
+    return { name, passed: false, weight: 20, reason: `Weak email-auth policies on login site: ${issues.join(", ")}`, evidence: spoofTag, spoofIndex: emailSpoofIndex };
+  }
   if (issues.length === 1 && issues[0] === "no DMARC") {
-    return { name, passed: false, weight: 10, reason: "Missing DMARC (SPF + MX present)", evidence: `Email Spoofability Index: ${emailSpoofIndex}/100`, spoofIndex: emailSpoofIndex };
+    return { name, passed: false, weight: 10, reason: "Missing DMARC (SPF + MX present)", evidence: spoofTag, spoofIndex: emailSpoofIndex };
   }
   if (issues.length >= 2) {
-    return { name, passed: false, weight: 25, reason: `Missing: ${issues.join(", ")}`, evidence: `Email Spoofability Index: ${emailSpoofIndex}/100`, spoofIndex: emailSpoofIndex };
+    return { name, passed: false, weight: 25, reason: `Missing: ${issues.join(", ")}`, evidence: spoofTag, spoofIndex: emailSpoofIndex };
   }
-  return { name, passed: true, weight: 0, reason: "Critical auth present", evidence: `Email Spoofability Index: ${emailSpoofIndex}/100`, spoofIndex: emailSpoofIndex };
-}
-
-// Email Spoofability Index: 100 = fully protected, 0 = trivially spoofable.
-// Separate from the web score; reported alongside it for context.
-function computeSpoofIndex({ mx, spf, dmarc }) {
-  let score = 0;
-  if (mx)   score += 30;
-  if (spf)  score += 30;
-  if (dmarc) score += 40;
-  return score;
+  return { name, passed: true, weight: 0, reason: "Critical auth present", evidence: spoofTag, spoofIndex: emailSpoofIndex };
 }
 
 // --- 6. HTTPS usage ---
@@ -386,4 +414,6 @@ export {
   testDisplayNameMismatch,
   displayNameSignals,
   computeSpoofIndex,
+  dmarcStrength,
+  spfStrength,
 };
