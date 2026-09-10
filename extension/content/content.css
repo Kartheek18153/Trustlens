@@ -2,21 +2,30 @@
   position: fixed;
   top: 0; left: 0; right: 0;
   z-index: 2147483647;
-  background: #dc2626;
+  background: linear-gradient(135deg, #b91c1c 0%, #dc2626 45%, #ef4444 100%);
   color: #fff;
   font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+  box-shadow: 0 2px 14px rgba(220, 38, 38, 0.45), 0 1px 0 rgba(255, 255, 255, 0.12) inset;
+  animation: trustlens-slide-down 0.3s cubic-bezier(0.2, 0.9, 0.3, 1.2);
+}
+@keyframes trustlens-slide-down {
+  from { transform: translateY(-100%); opacity: 0; }
+  to { transform: none; opacity: 1; }
 }
 .trustlens-banner-inner {
   display: flex; align-items: center; gap: 12px;
   padding: 10px 14px; max-width: 1200px; margin: 0 auto;
 }
-.trustlens-banner-title { font-weight: 700; }
+.trustlens-banner-title { font-weight: 700; letter-spacing: 0.01em; }
 .trustlens-banner-body { flex: 1; }
+.trustlens-banner-body b { text-shadow: 0 1px 2px rgba(0, 0, 0, 0.25); }
 .trustlens-banner-actions button {
-  background: rgba(255,255,255,0.15); color: #fff; border: 0;
-  padding: 6px 10px; border-radius: 4px; cursor: pointer;
+  background: rgba(255, 255, 255, 0.16); color: #fff; border: 0;
+  padding: 6px 12px; border-radius: 6px; cursor: pointer; font-weight: 500;
+  backdrop-filter: blur(4px);
+  transition: background 0.18s ease, transform 0.15s ease;
 }
-.trustlens-banner-actions button:hover { background: rgba(255,255,255,0.25); }
+.trustlens-banner-actions button:hover { background: rgba(255, 255, 255, 0.28); }
+.trustlens-banner-actions button:active { transform: scale(0.97); }
 .trustlens-email.dangerous { color: inherit; }
 .trustlens-email.caution   { color: inherit; }

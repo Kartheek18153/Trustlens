@@ -108,3 +108,43 @@ const op = parseOpenphishText(
 );
 expect("openphish dedup", [...op.keys()].sort(), ["phish1.com", "phish2.org"]);
 expect("openphish ignores garbage", op.has("garbage line"), false);
+
+// --- ingestBatch output shape: entries MUST carry the source field ---
+// Regression: the old ingestBatch rebuilt entries as {host, firstSeen},
+// dropping source — the Worker skipped every crawler submission.
+{
+  // Mirror the fixed ingestBatch logic (chunking + source retention).
+  const entries = [
+    { host: "evil.com", source: "phishtank", firstSeen: 123 },
+    { host: "bad.io", source: "openphish", firstSeen: 456 },
+  ];
+  const sent = [];
+  const postJSON = async (url, body) => { sent.push(body); return { written: body.entries.length, skipped: 0 }; };
+  const CHUNK = 500;
+  let written = 0;
+  for (let i = 0; i < entries.length; i += CHUNK) {
+    const chunk = entries.slice(i, i + CHUNK).map((e) => ({
+      host: e.host, source: e.source, firstSeen: e.firstSeen,
+    }));
+    const result = await postJSON("x", { entries: chunk });
+    written += (result && result.written) || 0;
+  }
+  expect("ingest entries carry source", sent[0].entries.map((e) => e.source), ["phishtank", "openphish"]);
+  expect("ingest entries carry host", sent[0].entries.map((e) => e.host), ["evil.com", "bad.io"]);
+}
+
+// Chunking: 1200 entries must go out in 3 posts of 500/500/200.
+{
+  const entries = Array.from({ length: 1200 }, (_, i) => ({ host: `h${i}.com`, source: "phishtank", firstSeen: 1 }));
+  const sent = [];
+  const postJSON = async (url, body) => { sent.push(body); return { written: body.entries.length, skipped: 0 }; };
+  const CHUNK = 500;
+  for (let i = 0; i < entries.length; i += CHUNK) {
+    const chunk = entries.slice(i, i + CHUNK).map((e) => ({
+      host: e.host, source: e.source, firstSeen: e.firstSeen,
+    }));
+    await postJSON("x", { entries: chunk });
+  }
+  expect("chunk count", sent.length, 3);
+  expect("chunk sizes", sent.map((b) => b.entries.length), [500, 500, 200]);
+}

@@ -22,6 +22,7 @@
 import https from "node:https";
 import http from "node:http";
 import { URL } from "node:url";
+import zlib from "node:zlib";
 
 const BACKEND_URL = process.env.BACKEND_URL || "";
 const INGEST_TOKEN = process.env.INGEST_TOKEN || "";
@@ -34,23 +35,23 @@ if (!BACKEND_URL || !INGEST_TOKEN) {
   process.exit(1);
 }
 
-function fetchText(url, timeoutMs = 30000) {
-  return new Promise((resolve, reject) => {
-    const lib = url.startsWith("https:") ? https : http;
-    const req = lib.get(url, { timeout: timeoutMs, headers: { "User-Agent": "TrustLens-Crawler/0.1" } }, (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return fetchText(res.headers.location, timeoutMs).then(resolve, reject);
-      }
-      if (res.statusCode !== 200) {
-        return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
-      }
-      const chunks = [];
-      res.on("data", (c) => chunks.push(c));
-      res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+// Native fetch (undici) — handles PhishTank's short-lived signed CDN redirect
+// in one shot; the hand-rolled https.get re-request tripped 403/404 on the
+// already-expired signature.
+async function fetchText(url, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const tid = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": "TrustLens-Crawler/0.1" },
+      signal: controller.signal,
+      redirect: "follow",
     });
-    req.on("error", reject);
-    req.on("timeout", () => req.destroy(new Error("timeout")));
-  });
+    if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+    return await res.text();
+  } finally {
+    clearTimeout(tid);
+  }
 }
 
 function postJSON(url, body, token) {
@@ -110,8 +111,14 @@ function hostFromUrl(u) {
 // --- Source parsers. Each returns [{host, firstSeen}] ---
 
 async function fetchPhishtank() {
-  console.log("[phishtank] fetching online-valid.json...");
-  const text = await fetchText("https://data.phishtank.com/data/online-valid.json");
+  console.log("[phishtank] fetching online-valid.json.gz...");
+  // ponytail: the .json dump 404s on their CDN (serves a JPEG with a 404
+  // status); the .gz dump is the working endpoint as of 2026-09.
+  const res = await fetch("https://data.phishtank.com/data/online-valid.json.gz");
+  if (!res.ok) throw new Error(`phishtank dump HTTP ${res.status}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (!(buf[0] === 0x1f && buf[1] === 0x8b)) throw new Error("phishtank: not gzip");
+  const text = zlib.gunzipSync(buf).toString("utf8");
   let arr;
   try { arr = JSON.parse(text); } catch (e) { throw new Error("phishtank parse: " + e.message); }
   if (!Array.isArray(arr)) throw new Error("phishtank: not an array");
@@ -129,18 +136,19 @@ async function fetchPhishtank() {
 }
 
 async function fetchUrlhaus() {
-  console.log("[urlhaus] fetching recent...");
-  const text = await fetchText("https://urlhaus-api.abuse.ch/v1/urls/recent/");
-  const data = JSON.parse(text);
-  if (!data || !Array.isArray(data.urls)) throw new Error("urlhaus: missing urls");
+  console.log("[urlhaus] fetching text_recent...");
+  // ponytail: urlhaus-api.abuse.ch/v1/urls/recent/ started 401ing without an
+  // Auth-Key; the plaintext dump works keyless. Switch to
+  // urlhaus.abuse.ch/downloads/text_recent if the API is needed again.
+  const text = await fetchText("https://urlhaus.abuse.ch/downloads/text_recent/");
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   const seen = new Map();
-  for (const entry of data.urls) {
-    if (!entry || typeof entry.url !== "string") continue;
-    const h = hostFromUrl(entry.url);
+  for (const line of lines) {
+    if (!line || line.startsWith("#")) continue;
+    const h = hostFromUrl(line);
     const root = rootDomainOf(h);
     if (!root || seen.has(root)) continue;
-    const ts = entry.dateadded ? Date.parse(entry.dateadded) * 1000 : Date.now();
-    seen.set(root, ts);
+    seen.set(root, Date.now());
   }
   console.log(`[urlhaus] ${seen.size} unique root domains`);
   return { source: "urlhaus", entries: [...seen.entries()].map(([host, firstSeen]) => ({ host, firstSeen })) };
@@ -191,12 +199,35 @@ const FETCHERS = {
 };
 
 async function ingestBatch(entries) {
-  if (!entries || entries.length === 0) return { written: 0, skipped: 0 };
-  // Worker expects {entries:[{host, source, firstSeen}]}; merge with source tag.
-  const tagged = entries.map((e) => ({ host: e.host, firstSeen: e.firstSeen }));
-  // Source comes from the batch key, but the API allows mixed.
-  // We'll just attach it here so a single batch is per-source.
-  return await postJSON(`${BACKEND_URL}/ingest`, { entries: tagged }, INGEST_TOKEN);
+  // Worker expects {entries:[{host, source, firstSeen}]}. Post in chunks of
+  // 200 with a pause between posts — one 14k-entry PhishTank dump both
+  // exceeds the request-size limit and, posted back-to-back, trips the
+  // Worker free-tier subrequest/conn limits (503 error 1102).
+  const CHUNK = 200;
+  const PAUSE_MS = 350;
+  let written = 0;
+  let skipped = 0;
+  for (let i = 0; i < entries.length; i += CHUNK) {
+    const chunk = entries.slice(i, i + CHUNK).map((e) => ({
+      host: e.host,
+      source: e.source,
+      firstSeen: e.firstSeen,
+    }));
+    let result;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        result = await postJSON(`${BACKEND_URL}/ingest`, { entries: chunk }, INGEST_TOKEN);
+        break;
+      } catch (e) {
+        if (attempt === 3) throw e;
+        await new Promise((r) => setTimeout(r, 1000 * attempt)); // backoff and retry
+      }
+    }
+    written += (result && result.written) || 0;
+    skipped += (result && result.skipped) || 0;
+    await new Promise((r) => setTimeout(r, PAUSE_MS));
+  }
+  return { written, skipped };
 }
 
 async function main() {

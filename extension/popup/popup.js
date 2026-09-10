@@ -65,6 +65,8 @@ els.checkBtn.addEventListener("click", async () => {
   els.score.textContent = "…";
   els.verdict.textContent = "";
   els.verdict.className = "verdict";
+  const cardEl = document.getElementById("verdictCard");
+  if (cardEl) cardEl.className = "verdict-card";
   try {
     const result = await chrome.runtime.sendMessage({
       type: "scoreHost",
@@ -98,6 +100,10 @@ function renderResult(result) {
   els.score.textContent = typeof result.score === "number" ? result.score : "—";
   els.verdict.textContent = result.verdict;
   els.verdict.className = "verdict " + result.verdict.toLowerCase();
+  const card = document.getElementById("verdictCard");
+  if (card) {
+    card.className = "verdict-card " + (result.verdict || "").toLowerCase();
+  }
   els.tests.innerHTML = "";
   for (const t of result.tests) {
     const card = document.createElement("div");
