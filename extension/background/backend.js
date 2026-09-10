@@ -6,6 +6,7 @@
 // Stored in chrome.storage.local key "trustlensBackendUrl".
 
 import { getRootDomain } from "./domain.js";
+import { DEFAULT_BACKEND_URL } from "../config.js";
 
 const CACHE_KEY = "trustlensBackendUrl";
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -18,13 +19,13 @@ export async function getBackendUrl() {
   const now = Date.now();
   if (memoryUrl && now - memoryAt < CACHE_TTL_MS) return memoryUrl;
   try {
-    if (typeof chrome === "undefined" || !chrome.storage || !chrome.storage.local) return "";
+    if (typeof chrome === "undefined" || !chrome.storage || !chrome.storage.local) return DEFAULT_BACKEND_URL;
     const data = await chrome.storage.local.get(CACHE_KEY);
-    memoryUrl = (data && data[CACHE_KEY]) || "";
+    memoryUrl = (data && data[CACHE_KEY]) || DEFAULT_BACKEND_URL;
     memoryAt = now;
     return memoryUrl;
   } catch (e) {
-    return memoryUrl || "";
+    return memoryUrl || DEFAULT_BACKEND_URL;
   }
 }
 
@@ -74,7 +75,12 @@ export async function testBackend(host) {
 export async function reportToBackend(host) {
   const url = await getBackendUrl();
   if (!url) return { ok: false, reason: "Backend not configured" };
-  const { trustlensReportToken } = await chrome.storage.local.get("trustlensReportToken");
+  let trustlensReportToken = "";
+  try {
+    ({ trustlensReportToken = "" } = await chrome.storage.local.get("trustlensReportToken"));
+  } catch (e) { /* fall through to default */ }
+  const { DEFAULT_REPORT_TOKEN } = await import("../config.js");
+  trustlensReportToken = trustlensReportToken || DEFAULT_REPORT_TOKEN;
   if (!trustlensReportToken) return { ok: false, reason: "Report token not set" };
   try {
     const endpoint = url.replace(/\/+$/, "") + "/report";

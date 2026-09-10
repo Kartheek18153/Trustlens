@@ -51,7 +51,15 @@ Each test card in the popup shows its name, Pass/Fail/Skip badge, the penalty it
 2. Toggle **Developer mode** on.
 3. Click **Load unpacked** and pick the `extension/` folder.
 4. The TrustLens icon appears next to the address bar.
-5. (Optional) Open the popup → **Help** tab → paste your Google Safe Browsing API key → **Save**. The key is stored in `chrome.storage.local`; it's never committed to disk by the extension code.
+5. (Optional) Bake in your keys so they survive reloads — copy `extension/config.example.js` to `extension/config.js` and fill in:
+
+   ```js
+   export const DEFAULT_GSB_KEY = "your-google-safe-browsing-key";
+   export const DEFAULT_BACKEND_URL = "https://trustlens-backend.<your-subdomain>.workers.dev";
+   export const DEFAULT_REPORT_TOKEN = "your-report-token";
+   ```
+
+   `config.js` is **gitignored** (never committed) and re-seeds `chrome.storage.local` on every service-worker start. Without it, set the key via the popup → **Help** tab (stored in `chrome.storage.local`, never written to disk by the extension).
 
 ## Run
 
@@ -170,6 +178,8 @@ extension/
     content.js             # email extraction, highlighting, DOM tests, banner, form interception
     content.css
   icons/                   # placeholder PNGs
+  config.js                # LOCAL-ONLY keys/URL defaults (gitignored; see config.example.js)
+  config.example.js        # template for config.js
   tests/                   # node self-checks
 backend/
   worker.js                # Cloudflare Worker — /score /ingest /report /health

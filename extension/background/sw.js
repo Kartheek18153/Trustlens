@@ -24,13 +24,31 @@ import { testHistoryRotation, fingerprint } from "./history_rotation.js";
 import { prewarm as prewarmDisposable } from "./disposable.js";
 import { getRootDomain, isValidDomain, isCheckableHost } from "./domain.js";
 import { isPopularRoot } from "./popular.js";
+import { DEFAULT_GSB_KEY, DEFAULT_BACKEND_URL, DEFAULT_IPINFO_TOKEN, DEFAULT_REPORT_TOKEN } from "../config.js";
 
 const HISTORY_KEY = "trustlens.history";
 const HISTORY_MAX = 50;
 
 // Pre-warm disposable / PhishTank / URLhaus / backend caches at SW startup.
 // Wrap in async IIFE — top-level await is not allowed in service worker modules.
+// Also re-seed any baked-in config.js defaults that are missing from
+// storage — chrome.storage.local is cleared on "Remove" + fresh "Load
+// unpacked", so without this the defaults would vanish every reload.
 (async () => {
+  try {
+    const seeds = {
+      trustlensGsbKey: DEFAULT_GSB_KEY,
+      trustlensBackendUrl: DEFAULT_BACKEND_URL,
+      trustlensIpinfoToken: DEFAULT_IPINFO_TOKEN,
+      trustlensReportToken: DEFAULT_REPORT_TOKEN,
+    };
+    const current = await chrome.storage.local.get(Object.keys(seeds));
+    for (const [key, def] of Object.entries(seeds)) {
+      if (def && !current[key]) {
+        await chrome.storage.local.set({ [key]: def });
+      }
+    }
+  } catch (e) { /* seeding is best-effort */ }
   prewarmDisposable();
   prewarmBackend();
   try { (await import("./test_phishtank.js")).prewarm(); } catch (e) { /* */ }
@@ -208,25 +226,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: true });
       } else if (msg.type === "getGsbKey") {
         const { trustlensGsbKey } = await chrome.storage.local.get("trustlensGsbKey");
-        sendResponse({ key: trustlensGsbKey || "" });
+        sendResponse({ key: trustlensGsbKey || DEFAULT_GSB_KEY });
       } else if (msg.type === "saveIpinfoToken") {
         await chrome.storage.local.set({ trustlensIpinfoToken: msg.token || "" });
         sendResponse({ ok: true });
       } else if (msg.type === "getIpinfoToken") {
         const { trustlensIpinfoToken } = await chrome.storage.local.get("trustlensIpinfoToken");
-        sendResponse({ token: trustlensIpinfoToken || "" });
+        sendResponse({ token: trustlensIpinfoToken || DEFAULT_IPINFO_TOKEN });
       } else if (msg.type === "saveBackendUrl") {
         await chrome.storage.local.set({ trustlensBackendUrl: msg.url || "" });
         sendResponse({ ok: true });
       } else if (msg.type === "getBackendUrl") {
         const { trustlensBackendUrl } = await chrome.storage.local.get("trustlensBackendUrl");
-        sendResponse({ url: trustlensBackendUrl || "" });
+        sendResponse({ url: trustlensBackendUrl || DEFAULT_BACKEND_URL });
       } else if (msg.type === "saveReportToken") {
         await chrome.storage.local.set({ trustlensReportToken: msg.token || "" });
         sendResponse({ ok: true });
       } else if (msg.type === "getReportToken") {
         const { trustlensReportToken } = await chrome.storage.local.get("trustlensReportToken");
-        sendResponse({ token: trustlensReportToken || "" });
+        sendResponse({ token: trustlensReportToken || DEFAULT_REPORT_TOKEN });
       } else {
         sendResponse({ error: "Unknown message type" });
       }
