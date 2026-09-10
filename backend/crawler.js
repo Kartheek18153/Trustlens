@@ -198,21 +198,35 @@ const FETCHERS = {
   threatfox: fetchThreatfox,
 };
 
+// First char of the root domain — must match the Worker's bucketOf().
+function bucketOf(host) {
+  const c = (host[0] || "").toLowerCase();
+  return /[0-9a-z]/.test(c) ? c : "x";
+}
+
 async function ingestBatch(entries) {
-  // Worker expects {entries:[{host, source, firstSeen}]}. Post in chunks of
-  // 200 with a pause between posts — one 14k-entry PhishTank dump both
-  // exceeds the request-size limit and, posted back-to-back, trips the
-  // Worker free-tier subrequest/conn limits (503 error 1102).
+  // Group entries by bucket so each POST maps to exactly one Worker bucket
+  // write. Chunked (200) with a pause + retry — back-to-back posts trip the
+  // free-tier subrequest/conn limits (503 error 1102).
   const CHUNK = 200;
   const PAUSE_MS = 350;
+  const byBucket = new Map();
+  for (const e of entries) {
+    const bc = bucketOf(e.host);
+    if (!byBucket.has(bc)) byBucket.set(bc, []);
+    byBucket.get(bc).push(e);
+  }
   let written = 0;
   let skipped = 0;
-  for (let i = 0; i < entries.length; i += CHUNK) {
-    const chunk = entries.slice(i, i + CHUNK).map((e) => ({
-      host: e.host,
-      source: e.source,
-      firstSeen: e.firstSeen,
-    }));
+  const posts = [];
+  for (const list of byBucket.values()) {
+    for (let i = 0; i < list.length; i += CHUNK) {
+      posts.push(list.slice(i, i + CHUNK).map((e) => ({
+        host: e.host, source: e.source, firstSeen: e.firstSeen,
+      })));
+    }
+  }
+  for (const chunk of posts) {
     let result;
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {

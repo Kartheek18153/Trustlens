@@ -182,15 +182,17 @@ async function withStubbedFetch(statusCode, run) {
     headers: { "X-TrustLens-Token": "tok" },
     body: JSON.stringify({ host }),
   });
-  // Seed: host already listed by phishtank.
-  store.set("host:race.example", JSON.stringify({
-    sources: [{ name: "phishtank", firstSeen: 1 }], lastSeen: 1,
+  // Seed: host already listed by phishtank — in the NEW bucket layout.
+  store.set("bucket:r", JSON.stringify({
+    "race.example": {
+      sources: [{ name: "phishtank", firstSeen: 1 }], lastSeen: Date.now(),
+    },
   }));
   const res = await worker.fetch(req("race.example"), env, {});
   expect("/report returns 200", res.status, 200);
   const body = await res.json();
   expect("/report reports=1", body.reports, 1);
-  const stored = JSON.parse(store.get("host:race.example"));
+  const stored = JSON.parse(store.get("bucket:r"))["race.example"];
   const names = (stored.sources || []).map((s) => s.name);
   expect("/report collab survives write", names.includes("collab"), true);
   expect("/report phishtank survives too", names.includes("phishtank"), true);
@@ -202,6 +204,157 @@ async function withStubbedFetch(statusCode, run) {
   const score = JSON.parse(store.get("score:race.example"));
   expect("/report 3 reports marks listed", score.listed, true);
   expect("/report listed weight boosted", score.weight, SOURCES.collab.weight + 20);
+}
+
+// --- legacy migration: pre-bucket host: entries still count ---
+{
+  const store = new Map();
+  const env = {
+    REPUTATION: {
+      async get(key, type) {
+        if (!store.has(key)) return null;
+        const v = store.get(key);
+        return type === "json" ? JSON.parse(v) : v;
+      },
+      async put(key, value) { store.set(key, value); },
+      async delete(key) { store.delete(key); },
+    },
+    REPORT_TOKEN: "tok",
+    _store: store,
+  };
+  store.set("host:legacy.example", JSON.stringify({
+    sources: [{ name: "urlhaus", firstSeen: 1 }], lastSeen: Date.now(),
+  }));
+  const res = await worker.fetch(new Request("https://x/report", {
+    method: "POST",
+    headers: { "X-TrustLens-Token": "tok" },
+    body: JSON.stringify({ host: "legacy.example" }),
+  }), env, {});
+  expect("legacy report 200", res.status, 200);
+  const bucket = JSON.parse(store.get("bucket:l"));
+  const names = bucket["legacy.example"].sources.map((s) => s.name);
+  expect("legacy urlhaus folded into bucket", names.includes("urlhaus"), true);
+  expect("legacy collab added", names.includes("collab"), true);
+}
+
+// --- ingest: bucketed writes ---
+{
+  const store = new Map();
+  const env = {
+    REPUTATION: {
+      async get(key, type) {
+        if (!store.has(key)) return null;
+        const v = store.get(key);
+        return type === "json" ? JSON.parse(v) : v;
+      },
+      async put(key, value) { store.set(key, value); },
+      async delete(key) { store.delete(key); },
+    },
+    INGEST_TOKEN: "tok",
+    _store: store,
+  };
+  const req = (entries) => new Request("https://x/ingest", {
+    method: "POST",
+    headers: { "X-TrustLens-Token": "tok" },
+    body: JSON.stringify({ entries }),
+  });
+  const t0 = Date.now();
+  let puts = 0;
+  const origPut = env.REPUTATION.put;
+  env.REPUTATION.put = async (k, v) => { puts++; return origPut(k, v); };
+
+  // 300 hosts across 3 buckets -> 3 bucket writes, 300 score deletes, 0 host: keys.
+  // Root domains are the hosts themselves (a<i>.com etc) so each lands in its own bucket.
+  const entries = [];
+  for (let i = 0; i < 100; i++) {
+    entries.push({ host: `a${i}.com`, source: "phishtank", firstSeen: t0 });
+    entries.push({ host: `b${i}.org`, source: "urlhaus", firstSeen: t0 });
+    entries.push({ host: `c${i}.net`, source: "openphish", firstSeen: t0 });
+  }
+  const res = await worker.fetch(req(entries), env, {});
+  const body = await res.json();
+  expect("bucket ingest written=300", body.written, 300);
+  expect("bucket ingest skipped=0", body.skipped, 0);
+  expect("bucket ingest 3 buckets", body.buckets.sort().join(","), "a,b,c");
+  expect("bucket writes exactly 3", puts, 3);
+  expect("bucket:a exists", store.has("bucket:a"), true);
+  expect("no per-host keys", store.has("host:a0.com"), false);
+
+  // No-op re-ingest of the same data -> 0 new writes.
+  puts = 0;
+  const res2 = await worker.fetch(req(entries), env, {});
+  expect("no-op re-ingest 0 writes", puts, 0);
+  const body2 = await res2.json();
+  expect("no-op re-ingest written=300", body2.written, 300);
+}
+
+// --- /score reads bucketed data ---
+{
+  const store = new Map();
+  const env = {
+    REPUTATION: {
+      async get(key, type) {
+        if (!store.has(key)) return null;
+        const v = store.get(key);
+        return type === "json" ? JSON.parse(v) : v;
+      },
+      async put(key, value) { store.set(key, value); },
+      async delete(key) { store.delete(key); },
+    },
+    _store: store,
+  };
+  store.set("bucket:p", JSON.stringify({
+    "phish.example": {
+      sources: [{ name: "phishtank", firstSeen: 1 }, { name: "urlhaus", firstSeen: 2 }],
+      lastSeen: Date.now(),
+    },
+    "stale.example": {
+      sources: [{ name: "phishtank", firstSeen: 1 }],
+      lastSeen: Date.now() - 8 * 24 * 60 * 60 * 1000, // 8 days old
+    },
+  }));
+  const res = await worker.fetch(new Request("https://x/score", {
+    method: "POST",
+    body: JSON.stringify({ host: "phish.example" }),
+  }), env, {});
+  const body = await res.json();
+  expect("score reads bucketed host", body.listed, true);
+  expect("score 2-source boost", body.weight, SOURCES.phishtank.weight + SOURCES.urlhaus.weight + 20);
+  const res2 = await worker.fetch(new Request("https://x/score", {
+    method: "POST",
+    body: JSON.stringify({ host: "stale.example" }),
+  }), env, {});
+  const body2 = await res2.json();
+  expect("stale entry ignored", body2.listed, false);
+}
+
+// --- /score: cache-write failure must NOT fail the lookup ---
+// The daily KV write limit makes put() throw; the score cache is an
+// optimization and must degrade to a MISS, not a 500.
+{
+  const store = new Map();
+  const env = {
+    REPUTATION: {
+      async get(key, type) {
+        if (!store.has(key)) return null;
+        const v = store.get(key);
+        return type === "json" ? JSON.parse(v) : v;
+      },
+      async put(key, value) { throw new Error("KV put() limit exceeded for the day."); },
+      async delete(key) { store.delete(key); },
+    },
+    _store: store,
+  };
+  store.set("bucket:l", JSON.stringify({
+    "limited.example": { sources: [{ name: "phishtank", firstSeen: 1 }], lastSeen: Date.now() },
+  }));
+  const res = await worker.fetch(new Request("https://x/score", {
+    method: "POST",
+    body: JSON.stringify({ host: "limited.example" }),
+  }), env, {});
+  expect("score survives cache-write failure", res.status, 200);
+  const body = await res.json();
+  expect("score still lists host", body.listed, true);
 }
 
 // --- rate limit: 30th request in a minute from one IP passes, 31st 429s ---

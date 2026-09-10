@@ -133,18 +133,33 @@ expect("openphish ignores garbage", op.has("garbage line"), false);
   expect("ingest entries carry host", sent[0].entries.map((e) => e.host), ["evil.com", "bad.io"]);
 }
 
-// Chunking: 1200 entries must go out in 3 posts of 500/500/200.
+// Chunking + bucket grouping: entries are grouped by first char so each POST
+// maps to one Worker bucket. 1200 a-hosts + 300 b-hosts -> 6+2 posts, and
+// every post is single-bucket.
 {
-  const entries = Array.from({ length: 1200 }, (_, i) => ({ host: `h${i}.com`, source: "phishtank", firstSeen: 1 }));
+  const entries = [];
+  for (let i = 0; i < 1200; i++) entries.push({ host: `a${i}.com`, source: "phishtank", firstSeen: 1 });
+  for (let i = 0; i < 300; i++) entries.push({ host: `b${i}.org`, source: "urlhaus", firstSeen: 1 });
   const sent = [];
   const postJSON = async (url, body) => { sent.push(body); return { written: body.entries.length, skipped: 0 }; };
-  const CHUNK = 500;
-  for (let i = 0; i < entries.length; i += CHUNK) {
-    const chunk = entries.slice(i, i + CHUNK).map((e) => ({
-      host: e.host, source: e.source, firstSeen: e.firstSeen,
-    }));
-    await postJSON("x", { entries: chunk });
+
+  // Mirror the fixed ingestBatch grouping.
+  const CHUNK = 200;
+  const byBucket = new Map();
+  for (const e of entries) {
+    const bc = e.host[0].toLowerCase();
+    if (!byBucket.has(bc)) byBucket.set(bc, []);
+    byBucket.get(bc).push(e);
   }
-  expect("chunk count", sent.length, 3);
-  expect("chunk sizes", sent.map((b) => b.entries.length), [500, 500, 200]);
+  const posts = [];
+  for (const list of byBucket.values()) {
+    for (let i = 0; i < list.length; i += CHUNK) {
+      posts.push(list.slice(i, i + CHUNK).map((e) => ({ host: e.host, source: e.source, firstSeen: e.firstSeen })));
+    }
+  }
+  for (const chunk of posts) await postJSON("x", { entries: chunk });
+
+  expect("post count", sent.length, 8); // 1200/200 + 300/200
+  expect("every post single-bucket", sent.every((b) => new Set(b.entries.map((e) => e.host[0])).size === 1), true);
+  expect("post sizes", sent.map((b) => b.entries.length), [200, 200, 200, 200, 200, 200, 200, 100]);
 }

@@ -8,7 +8,14 @@
 //   GET  /health       — for monitoring
 //
 // KV layout:
-//   host:<rootDomain> -> JSON { sources: [{name, firstSeen}], lastSeen }    TTL 7d
+//   bucket:<char>     -> packed map { <root>: { sources:[{name,firstSeen}],
+//                                             reports?, lastSeen } }
+//                        ~36 buckets (first char of the root). A 14k-host
+//                        feed = ~36 writes/day instead of 14k — the free tier
+//                        caps KV writes at 1,000/day, so per-host keys can
+//                        never hold a full feed. No bucket TTL: staleness is
+//                        per-entry — lastSeen older than 7 days is ignored at
+//                        read time and pruned on the next rewrite.
 //   score:<root>      -> cached /score response                              TTL 5m
 //   asn:<ip>          -> { asn, org, country } | { error: "..." }           TTL 24h
 //   ct:<rootDomain>   -> { firstSeen, certCount } | { error: "..." }        TTL 24h
@@ -20,6 +27,9 @@ const KV_TTL_SECONDS = 7 * 24 * 60 * 60;
 const SCORE_TTL_SECONDS = 5 * 60;
 const ASN_TTL_SECONDS = 24 * 60 * 60;
 const CT_TTL_SECONDS = 24 * 60 * 60;
+
+// Per-entry staleness window (matches the old per-host KV TTL).
+const STALE_MS = 7 * 24 * 60 * 60 * 1000;
 
 // Rate limit for the tokenless public endpoints (/score /asn /ct).
 // In-memory per-isolate: KV writes would cost more than the abuse they
@@ -90,29 +100,70 @@ function jsonResponse(body, status = 200, extraHeaders = {}) {
   });
 }
 
+// --- bucketed host storage ---
+// Buckets keyed by first char of the root domain (0-9a-z). Each bucket is one
+// KV entry holding a packed map of root -> {sources, reports?, lastSeen}.
+// One bucket write per ingest chunk beats the free tier's 1k writes/day cap.
+
+const BUCKET_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz";
+
+function bucketOf(root) {
+  const c = (root[0] || "").toLowerCase();
+  if (BUCKET_CHARS.includes(c)) return c;
+  return "x"; // roots starting with anything else (shouldn't happen post-validation)
+}
+
+function bucketKey(root) {
+  return `bucket:${bucketOf(root)}`;
+}
+
+async function readBucket(env, root) {
+  const map = await env.REPUTATION.get(bucketKey(root), "json");
+  return map && typeof map === "object" ? map : {};
+}
+
+// Prune stale entries before writing so buckets stay bounded: a bucket only
+// shrinks when it's touched, which is fine — read path ignores stale anyway.
+function pruneStale(map, now = Date.now()) {
+  for (const [host, e] of Object.entries(map)) {
+    if (!e || typeof e.lastSeen !== "number" || now - e.lastSeen > STALE_MS) {
+      delete map[host];
+    }
+  }
+  return map;
+}
+
+async function writeBucket(env, root, map) {
+  await env.REPUTATION.put(bucketKey(root), JSON.stringify(map));
+}
+
 async function readHost(env, root) {
-  const key = `host:${root}`;
-  const cached = await env.REPUTATION.get(key, "json");
-  return cached || null;
+  const map = await readBucket(env, root);
+  const entry = map[root];
+  if (!entry || typeof entry.lastSeen !== "number") return null;
+  if (Date.now() - entry.lastSeen > STALE_MS) return null;
+  return entry;
 }
 
 async function writeHost(env, root, entry) {
-  const key = `host:${root}`;
-  await env.REPUTATION.put(key, JSON.stringify(entry), {
-    expirationTtl: KV_TTL_SECONDS,
-  });
+  const map = await readBucket(env, root);
+  map[root] = entry;
+  pruneStale(map);
+  await writeBucket(env, root, map);
 }
 
 async function mergeHost(env, root, source, firstSeen) {
-  const existing = await readHost(env, root);
+  const map = await readBucket(env, root);
   const now = Date.now();
-  const sources = Array.isArray(existing && existing.sources) ? [...existing.sources] : [];
-  if (!sources.find((s) => s.name === source)) {
+  const existing = map[root];
+  const sources = existing && Array.isArray(existing.sources) ? [...existing.sources] : [];
+  const alreadyListed = sources.find((s) => s.name === source);
+  if (!alreadyListed) {
     sources.push({ name: source, firstSeen: firstSeen || now });
   }
-  const merged = { sources, lastSeen: now };
-  await writeHost(env, root, merged);
-  return merged;
+  const merged = { sources, reports: existing && existing.reports, lastSeen: now };
+  map[root] = merged;
+  return { merged, map, changed: !alreadyListed };
 }
 
 // Aggregate across all stored sources → weight + verdict.
@@ -153,7 +204,9 @@ async function handleScore(request, env) {
   if (cached) {
     return jsonResponse(JSON.parse(cached), 200, { "X-Cache": "HIT" });
   }
-  const entry = await readHost(env, root);
+  const entry = (await readHost(env, root))
+    // Legacy pre-bucket key, still within its old 7d TTL during migration.
+    || await env.REPUTATION.get(`host:${root}`, "json").catch(() => null);
   const agg = aggregateFromSources(entry && entry.sources);
   const out = {
     host: root,
@@ -162,9 +215,11 @@ async function handleScore(request, env) {
     sources: agg.sources,
     timestamp: Date.now(),
   };
+  // Cache is an optimization — a failed write (e.g. daily KV limit) must
+  // never fail the lookup itself.
   await env.REPUTATION.put(cacheKey, JSON.stringify(out), {
     expirationTtl: SCORE_TTL_SECONDS,
-  });
+  }).catch(() => {});
   return jsonResponse(out, 200, { "X-Cache": "MISS" });
 }
 
@@ -178,27 +233,57 @@ async function handleIngest(request, env) {
   if (!entries) {
     return jsonResponse({ error: "Missing entries[]" }, 400);
   }
+  if (entries.length > 1000) {
+    return jsonResponse({ error: "Too many entries (max 1000)" }, 400);
+  }
+  // Group by bucket: one read + at most one write per bucket. A full 14k-host
+  // crawl is ~36 writes total, and a re-crawl that adds nothing new writes 0.
   let written = 0;
   let skipped = 0;
-  const batch = [];
-  const roots = new Set();
+  const buckets = new Map(); // bucketChar -> { map, roots: Set, changed: bool }
   for (const e of entries) {
     if (!e || typeof e.host !== "string" || typeof e.source !== "string") { skipped++; continue; }
     const root = rootDomainOf(e.host);
     if (!isValidDomain(root)) { skipped++; continue; }
     if (!SOURCES[e.source]) { skipped++; continue; }
-    roots.add(root);
-    batch.push(mergeHost(env, root, e.source, e.firstSeen));
+    const bc = bucketOf(root);
+    let b = buckets.get(bc);
+    if (!b) { b = { map: null, roots: new Set(), changed: false }; buckets.set(bc, b); }
+    b.roots.add(root);
+    b.pending = b.pending || [];
+    b.pending.push({ root, source: e.source, firstSeen: e.firstSeen });
     written++;
-    if (batch.length >= 50) {
-      await Promise.all(batch.splice(0));
+  }
+  const roots = new Set();
+  for (const [bc, b] of buckets) {
+    if (!b.map) b.map = await readBucketByKey(env, bc);
+    for (const { root, source, firstSeen } of b.pending) {
+      const now = Date.now();
+      const existing = b.map[root];
+      const sources = existing && Array.isArray(existing.sources) ? existing.sources : [];
+      if (!sources.find((s) => s.name === source)) {
+        sources.push({ name: source, firstSeen: firstSeen || now });
+        b.changed = true;
+      }
+      b.map[root] = { sources, reports: existing && existing.reports, lastSeen: now };
+      roots.add(root);
+    }
+    if (b.changed) {
+      pruneStale(b.map);
+      await env.REPUTATION.put(`bucket:${bc}`, JSON.stringify(b.map));
     }
   }
-  if (batch.length > 0) await Promise.all(batch);
-  // Invalidate score caches for newly-listed hosts — otherwise /score serves
+  // Invalidate score caches for touched hosts — otherwise /score serves
   // "not listed" for up to 5 minutes after the feed sees the host.
+  // Only hosts whose bucket actually changed can differ, but deleting for
+  // all touched roots is cheap and correct.
   await Promise.all([...roots].map((r) => env.REPUTATION.delete(`score:${r}`).catch(() => {})));
-  return jsonResponse({ written, skipped });
+  return jsonResponse({ written, skipped, buckets: [...buckets.keys()] });
+}
+
+async function readBucketByKey(env, bc) {
+  const map = await env.REPUTATION.get(`bucket:${bc}`, "json");
+  return map && typeof map === "object" ? map : {};
 }
 
 async function handleReport(request, env) {
@@ -215,25 +300,29 @@ async function handleReport(request, env) {
   if (!isValidDomain(root)) {
     return jsonResponse({ error: "Invalid host" }, 400);
   }
-  // Merge collab source + increment report count in ONE write. The old code
-  // read, merged, then wrote stale data — clobbering the collab entry it
-  // just added and any source that landed in between (lost-update race).
-  const existing = await readHost(env, root);
+  // Merge collab source + increment report count in ONE bucket write.
+  // (Legacy pre-bucket `host:` entries are folded in once, then left to
+  // expire — every new write lands in the bucket.)
+  const legacy = await env.REPUTATION.get(`host:${root}`, "json").catch(() => null);
+  const map = await readBucket(env, root);
+  const existing = map[root] || (legacy && { sources: legacy.sources, reports: legacy.reports }) || null;
   const sources = existing && Array.isArray(existing.sources) ? [...existing.sources] : [];
   if (!sources.find((s) => s.name === "collab")) {
     sources.push({ name: "collab", firstSeen: Date.now() });
   }
   const reports = ((existing && existing.reports) || 0) + 1;
-  await writeHost(env, root, { sources, reports, lastSeen: Date.now() });
+  map[root] = { sources, reports, lastSeen: Date.now() };
+  pruneStale(map);
+  await writeBucket(env, root, map);
   // Mark collab listing only after ≥3 independent reports. Invalidate the
   // score cache so the next /score sees the new state.
   if (reports >= 3) {
     await env.REPUTATION.put(`score:${root}`, JSON.stringify({
       host: root, listed: true, weight: SOURCES.collab.weight + 20,
       sources: sources.map((s) => s.name), timestamp: Date.now(),
-    }), { expirationTtl: SCORE_TTL_SECONDS });
+    }), { expirationTtl: SCORE_TTL_SECONDS }).catch(() => {});
   } else {
-    await env.REPUTATION.delete(`score:${root}`);
+    await env.REPUTATION.delete(`score:${root}`).catch(() => {});
   }
   return jsonResponse({ ok: true, reports });
 }
@@ -270,7 +359,7 @@ async function handleAsn(request, env) {
       if (res.status === 429 || res.status === 403) {
         const rec = { error: `HTTP ${res.status}` };
         out[ip] = rec;
-        await env.REPUTATION.put(`asn:${ip}`, JSON.stringify(rec), { expirationTtl: ASN_TTL_SECONDS });
+        await env.REPUTATION.put(`asn:${ip}`, JSON.stringify(rec), { expirationTtl: ASN_TTL_SECONDS }).catch(() => {});
         return;
       }
       if (!res.ok) { out[ip] = { error: `HTTP ${res.status}` }; return; }
@@ -284,7 +373,7 @@ async function handleAsn(request, env) {
         country: data.country || null,
       };
       out[ip] = rec;
-      await env.REPUTATION.put(`asn:${ip}`, JSON.stringify(rec), { expirationTtl: ASN_TTL_SECONDS });
+      await env.REPUTATION.put(`asn:${ip}`, JSON.stringify(rec), { expirationTtl: ASN_TTL_SECONDS }).catch(() => {});
     } catch (e) {
       out[ip] = { error: e.message };
     }
@@ -309,10 +398,10 @@ async function handleCt(request, env) {
   if (!out) out = await queryCertspotter(domain);
   if (!out) {
     const err = { error: "all CT sources failed" };
-    await env.REPUTATION.put(`ct:${domain}`, JSON.stringify(err), { expirationTtl: 5 * 60 });
+    await env.REPUTATION.put(`ct:${domain}`, JSON.stringify(err), { expirationTtl: 5 * 60 }).catch(() => {});
     return jsonResponse(err, 200);
   }
-  await env.REPUTATION.put(`ct:${domain}`, JSON.stringify(out), { expirationTtl: CT_TTL_SECONDS });
+  await env.REPUTATION.put(`ct:${domain}`, JSON.stringify(out), { expirationTtl: CT_TTL_SECONDS }).catch(() => {});
   return jsonResponse(out);
 }
 
